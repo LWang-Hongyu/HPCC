@@ -201,6 +201,10 @@ public:
 	void TakeDown(); // take down this device
 	void UpdateNextAvail(Time t);
 
+  void TasselFinishTime();
+  void TasselTransmitComplete(void);
+  bool TasselTransmitStart(Ptr<Packet> p);
+
 	TracedCallback<Ptr<const Packet>, Ptr<RdmaQueuePair> > m_traceQpDequeue; // the trace for printing dequeue
 };
 

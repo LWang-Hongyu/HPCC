@@ -47,12 +47,24 @@
 #include "ns3/pointer.h"
 #include "ns3/custom-header.h"
 
+#include "ns3/time-wheel.h"
+
 #include <iostream>
 
+using namespace std;
 NS_LOG_COMPONENT_DEFINE("QbbNetDevice");
 
 namespace ns3 {
 	
+
+	int max_pkt=8;//the max number of packets per schedule period for one QP
+	int max_QP=8;//the max number of QPs per schedule period 
+	Time PCIE_Latency=Time(1000);//PCIE latency as 1000ns
+	uint32_t pkt_num=60;//max pkt number in Desc buffer
+	Time lastPkt_finish_time=Time(0);
+	uint32_t qp_counter=0;
+	bool tassel_ornot=false;
+	TimeWheel timeWheel;
 	uint32_t RdmaEgressQueue::ack_q_idx = 3;
 	// RdmaEgressQueue
 	TypeId RdmaEgressQueue::GetTypeId (void)
@@ -255,14 +267,57 @@ namespace ns3 {
 	}
 
 	void
+		QbbNetDevice::TasselTransmitComplete(void)
+	{
+		NS_LOG_FUNCTION(this);
+		NS_ASSERT_MSG(m_txMachineState == BUSY, "Must be BUSY if transmitting");
+		m_txMachineState = READY;
+		NS_ASSERT_MSG(m_currentPkt != 0, "QbbNetDevice::TransmitComplete(): m_currentPkt zero");
+		m_phyTxEndTrace(m_currentPkt);
+		m_currentPkt = 0;
+		if(timeWheel.LengthFinishTimeWheel()!=0)
+			TasselFinishTime();
+		else
+			DequeueAndTransmit();
+	}
+				
+    void 
+    	QbbNetDevice::TasselFinishTime()
+    {
+    	if(timeWheel.LengthFinishTimeWheel()==(uint32_t)0)
+    	{
+    		return;
+    	}
+		/***sort for finish time wheel***/
+		timeWheel.SortFinishTime();
+		//printf("[debug] finish time wheel size:%d\n",timeWheel.LengthFinishTimeWheel());
+		//NS_LOG_FUNCTION(this);
+		if (!m_linkUp) return; // if link is down, return
+		if (m_txMachineState == BUSY) return;	// Quit if channel busy
+		// while(m_txMachineState == BUSY){}
+		ns3::QPN_Time temp=timeWheel.PopFinishTime();
+		
+		Ptr<Packet> p = m_rdmaEQ->m_rdmaGetNxtPkt(temp.QP);
+		
+		m_traceQpDequeue(p, temp.QP);
+		TasselTransmitStart(p);
+		m_rdmaPktSent(temp.QP, p, m_tInterframeGap);
+
+		//cout<<"[debug] QP:"<<temp.QP<<" packet:"<<p<<"\n";
+		
+    }
+
+	void
 		QbbNetDevice::DequeueAndTransmit(void)
 	{
 		NS_LOG_FUNCTION(this);
 		if (!m_linkUp) return; // if link is down, return
 		if (m_txMachineState == BUSY) return;	// Quit if channel busy
 		Ptr<Packet> p;
+		
 		if (m_node->GetNodeType() == 0){
 			int qIndex = m_rdmaEQ->GetNextQindex(m_paused);
+			//cout<<"qIndex: "<<qIndex<<endl;
 			if (qIndex != -1024){
 				if (qIndex == -1){ // high prio
 					p = m_rdmaEQ->DequeueQindex(qIndex);
@@ -270,16 +325,67 @@ namespace ns3 {
 					TransmitStart(p);
 					return;
 				}
+				/**********************
+			 	* Tassel simulator start
+			 	* *******************/
+				/***packet schedule start***/
 				// a qp dequeue a packet
-				Ptr<RdmaQueuePair> lastQp = m_rdmaEQ->GetQp(qIndex);
-				p = m_rdmaEQ->DequeueQindex(qIndex);
+				//printf( "timewheelsize: %d \n",timeWheel.LengthFinishTimeWheel());
+				if (timeWheel.LengthFinishTimeWheel()!=0)
+				{
+					//TasselFinishTime();
+					return;
+				}
+				
+				Time lastPkt=lastPkt_finish_time;
+				//每次调度QP都从中取max_pkt个包
+				for(int i=0;i<max_pkt;i++){
+					cout<<"[debug] Simulator now :"<<Simulator::Now()<<endl;
+					Ptr<RdmaQueuePair> lastQp = m_rdmaEQ->GetQp(qIndex);
+					//p = m_rdmaEQ->DequeueQindex(qIndex);
 
-				// transmit
-				m_traceQpDequeue(p, lastQp);
-				TransmitStart(p);
+					Time txStartTime = Max(lastPkt_finish_time,lastQp->m_nextAvail);
+					Time txTime = Seconds(m_bps.CalculateTxTime(lastQp->lastPktSize));
+					Time txCompleteTime = txTime + m_tInterframeGap;
+					lastPkt+=txCompleteTime;
+					if (txStartTime<= Simulator::Now()&&txStartTime<Simulator::Now()+PCIE_Latency){
+						ns3::QPN_Time temp(lastQp,txStartTime,txCompleteTime);
+						timeWheel.PushStartTime(temp);
+					}
+					else {//为了防止Packet取出来但是没有传输，把后面一个包也放在这里传输
+						ns3::QPN_Time temp(lastQp,txStartTime,txCompleteTime);
+						timeWheel.PushStartTime(temp);
+						break;
+					}
+				}
+				
+				//printf("[debug] start time wheel size:%d\n",timeWheel.LengthStartTimeWheel());
+				qp_counter++;
+				cout<<"How many Qps: "<<m_rdmaEQ->m_qpGrp->GetN()<<endl;
+				//if(timeWheel.LengthStartTimeWheel()>=pkt_num||(max_pkt*m_rdmaEQ->m_qpGrp->GetN()>=timeWheel.LengthStartTimeWheel()&&max_pkt*(m_rdmaEQ->m_qpGrp->GetN()-1)<timeWheel.LengthStartTimeWheel()))//这里要判断所有的qp都调度了一遍，也会开始传输
+				if(timeWheel.LengthStartTimeWheel()>=pkt_num||qp_counter%max_QP==0||(m_rdmaEQ->m_qpGrp->GetN()-1)<=qp_counter)//这个判断条件不对
+				{
+					/***sort for start time wheel***/
+					//timeWheel.SortStartTime();
+					qp_counter=0;
+					int st_size=timeWheel.LengthStartTimeWheel();
+					for (int i=0;i<st_size;i++){
+						ns3::QPN_Time temp_s=timeWheel.PopStartTime();
+						ns3::QPN_Time temp_f(temp_s.QP,temp_s.othertime,temp_s.time);
+						timeWheel.PushFinishTime(temp_f);
+					}
+					TasselFinishTime();
+				}
+				/***packet schedule end***/
+				/************************
+				 * Tassel simulator end
+				 * *********************/
+				// // transmit
+				// m_traceQpDequeue(p, lastQp);
+				// TransmitStart(p);
 
-				// update for the next avail time
-				m_rdmaPktSent(lastQp, p, m_tInterframeGap);
+				// // update for the next avail time
+				// m_rdmaPktSent(lastQp, p, m_tInterframeGap);
 			}else { // no packet to send
 				NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
 				Time t = Simulator::GetMaximumSimulationTime();
@@ -444,6 +550,7 @@ namespace ns3 {
 		// We need to tell the channel that we've started wiggling the wire and
 		// schedule an event that will be executed when the transmission is complete.
 		//
+		//cout<<"[debug] TransmitStart() m_txMachineState is "<<m_txMachineState<<endl;
 		NS_ASSERT_MSG(m_txMachineState == READY, "Must be READY to transmit");
 		m_txMachineState = BUSY;
 		m_currentPkt = p;
@@ -453,6 +560,34 @@ namespace ns3 {
 		NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.GetSeconds() << "sec");
 		Simulator::Schedule(txCompleteTime, &QbbNetDevice::TransmitComplete, this);
 
+		bool result = m_channel->TransmitStart(p, this, txTime);
+		if (result == false)
+		{
+			m_phyTxDropTrace(p);
+		}
+		return result;
+	}
+
+	bool
+		QbbNetDevice::TasselTransmitStart(Ptr<Packet> p)
+	{
+		NS_LOG_FUNCTION(this << p);
+		NS_LOG_LOGIC("UID is " << p->GetUid() << ")");
+		//
+		// This function is called to start the process of transmitting a packet.
+		// We need to tell the channel that we've started wiggling the wire and
+		// schedule an event that will be executed when the transmission is complete.
+		//
+		//cout<<"[debug] TransmitStart() m_txMachineState is "<<m_txMachineState<<endl;
+		NS_ASSERT_MSG(m_txMachineState == READY, "Must be READY to transmit");
+		m_txMachineState = BUSY;
+		m_currentPkt = p;
+		m_phyTxBeginTrace(m_currentPkt);
+		Time txTime = Seconds(m_bps.CalculateTxTime(p->GetSize()));
+		Time txCompleteTime = txTime + m_tInterframeGap;
+		NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.GetSeconds() << "sec");
+		Simulator::Schedule(txCompleteTime, &QbbNetDevice::TasselTransmitComplete, this);
+		lastPkt_finish_time=txCompleteTime+Simulator::Now();
 		bool result = m_channel->TransmitStart(p, this, txTime);
 		if (result == false)
 		{
@@ -473,13 +608,13 @@ namespace ns3 {
 
    void QbbNetDevice::NewQp(Ptr<RdmaQueuePair> qp){
 	   qp->m_nextAvail = Simulator::Now();
-	   DequeueAndTransmit();
+		DequeueAndTransmit();
    }
    void QbbNetDevice::ReassignedQp(Ptr<RdmaQueuePair> qp){
-	   DequeueAndTransmit();
+		DequeueAndTransmit();
    }
    void QbbNetDevice::TriggerTransmit(void){
-	   DequeueAndTransmit();
+		DequeueAndTransmit();
    }
 
 	void QbbNetDevice::SetQueue(Ptr<BEgressQueue> q){
