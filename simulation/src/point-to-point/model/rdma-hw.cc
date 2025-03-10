@@ -12,6 +12,10 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+// /***************UnfairDNNSchduler***********/
+// #include "ns3/cmsketch.h"
+// #include <iostream>
+// /***************UnfairDNNSchduler***********/
 
 namespace ns3{
 
@@ -178,8 +182,7 @@ TypeId RdmaHw::GetTypeId (void)
 	return tid;
 }
 
-RdmaHw::RdmaHw(){
-}
+RdmaHw::RdmaHw(){}
 
 void RdmaHw::SetNode(Ptr<Node> node){
 	m_node = node;
@@ -229,6 +232,44 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 	qp->SetVarWin(m_var_win);
 	qp->SetAppNotifyCallback(notifyAppFinish);
 
+	// add qp
+	uint32_t nic_idx = GetNicIdxOfQp(qp);
+	m_nic[nic_idx].qpGrp->AddQp(qp);
+	uint64_t key = GetQpKey(dip.Get(), sport, pg);
+	m_qpMap[key] = qp;
+
+	// set init variables
+	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
+	qp->m_rate = m_bps;
+	qp->m_max_rate = m_bps;
+	if (m_cc_mode == 1){
+		qp->mlx.m_targetRate = m_bps;
+	}else if (m_cc_mode == 3){
+		qp->hp.m_curRate = m_bps;
+		if (m_multipleRate){
+			for (uint32_t i = 0; i < IntHeader::maxHop; i++)
+				qp->hp.hopState[i].Rc = m_bps;
+		}
+	}else if (m_cc_mode == 7){
+		qp->tmly.m_curRate = m_bps;
+	}else if (m_cc_mode == 10){
+		qp->hpccPint.m_curRate = m_bps;
+	}
+
+	// Notify Nic
+	m_nic[nic_idx].dev->NewQp(qp);
+}
+void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, uint64_t bytes_iter,uint64_t gap,Callback<void> notifyAppFinish){
+	// create qp
+	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
+	qp->SetSize(size);
+	qp->SetWin(win);
+	qp->SetBaseRtt(baseRtt);
+	qp->SetVarWin(m_var_win);
+	qp->SetAppNotifyCallback(notifyAppFinish);
+	/********DCQCN DNN Scheduler******/
+	qp->SetIter(bytes_iter,gap);
+	/********DCQCN DNN Scheduler******/
 	// add qp
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].qpGrp->AddQp(qp);
@@ -584,8 +625,15 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 }
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){
-	qp->lastPktSize = pkt->GetSize();
-	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
+	/**************DNN DCQCN Scheduler *************/
+	if(qp->GetBytesSended()%static_cast<uint64_t>(qp->bytes_per_iteration)<1000&&qp->GetBytesSended()>=static_cast<uint64_t>(1000))
+	{
+		UpdateNextAvail(qp, interframeGap+qp->Iteration, pkt->GetSize());
+	}
+	/**************DNN DCQCN Scheduler *************/
+	else{
+		UpdateNextAvail(qp, interframeGap, pkt->GetSize());
+	}
 }
 
 void RdmaHw::UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size){
